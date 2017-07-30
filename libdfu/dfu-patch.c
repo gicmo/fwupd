@@ -246,12 +246,14 @@ dfu_patch_import (DfuPatch *self, GBytes *blob, GError **error)
 		DfuPatchChunk *chunk;
 		guint32 chunk_sz = GUINT32_FROM_LE (chunkhdr->sz);
 		guint32 chunk_off = GUINT32_FROM_LE (chunkhdr->off);
-		if (off + chunk_sz > sz) {
+
+		/* check chunk size, assuming it can overflow */
+		if (chunk_sz > sz || off + chunk_sz > sz) {
 			g_set_error (error,
 				     DFU_ERROR,
 				     DFU_ERROR_INVALID_FILE,
 				     "chunk offset 0x%04x outsize file size 0x%04x",
-				     (guint) (chunk_off + chunk_sz), (guint) sz);
+				     (guint) (off + chunk_sz), (guint) sz);
 			return FALSE;
 		}
 		chunk = g_new0 (DfuPatchChunk, 1);
