@@ -190,6 +190,11 @@ if get_option('enable-tbtfwu')
   tbtfwu = dependency('libtbtfwu', version : '>= 1', required: false)
 endif
 
+if get_option('enable-thunderbolt')
+  udev = dependency('libudev')
+  umockdev = dependency('umockdev-1.0', required: false)
+endif
+
 if get_option('enable-systemd')
   systemd = dependency('systemd', version : '>= 231')
   conf.set('HAVE_SYSTEMD' , '1')
