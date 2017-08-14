@@ -32,52 +32,56 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(udev_monitor, udev_monitor_unref);
 typedef struct udev_device udev_device;
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(udev_device, udev_device_unref);
 
-
 struct FuPluginData {
-	struct udev  *udev;
-	udev_monitor *monitor;
-	int           monitor_fd;
-	GSource      *monitor_source;
-	guint         monitor_tag;
+	struct udev	*udev;
+	udev_monitor	*monitor;
+	int		 monitor_fd;
+	GSource		*monitor_source;
+	guint		 monitor_tag;
 };
 
 static gchar *
 fu_plugin_thunderbolt_gen_id (struct udev_device *device)
 {
 	gchar *id;
-
 	id = g_strdup_printf ("tbt-%s", udev_device_get_syspath (device));
 	g_strdelimit (id, "/:.-", '_');
-
 	return id;
 }
 
-static gboolean
+static guint16
 fu_plugin_thunderbolt_udev_get_id (udev_device *device,
-				   const char  *name,
-				   guint       *out)
+				   const char *name,
+				   GError **error)
 {
 	const char *sysfs;
 	guint64 id;
 
 	sysfs = udev_device_get_sysattr_value (device, name);
-
 	if (sysfs == NULL) {
-		g_warning ("failed get id (%s) parse %s", name, sysfs);
-		return FALSE;
+		g_set_error (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_INTERNAL,
+			     "failed get id %s for %s", name, sysfs);
+		return 0x0;
 	}
 
 	id = g_ascii_strtoull (sysfs, NULL, 16);
 	if (id == 0x0) {
-		g_warning ("failed to parse %s", sysfs);
-		return FALSE;
-	} else if (id > G_MAXUINT) {
-		g_warning ("vendor id overflows guint %s", sysfs);
-		return FALSE;
+		g_set_error (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_INTERNAL,
+			     "failed to parse %s", sysfs);
+		return 0x0;
 	}
-
-	*out = id;
-	return TRUE;
+	if (id > G_MAXUINT16) {
+		g_set_error (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_INTERNAL,
+			     "vendor id overflows %s", sysfs);
+		return 0x0;
+	}
+	return (guint16) id;
 }
 
 static gboolean
@@ -94,7 +98,7 @@ fu_plugin_thunderbolt_is_host (udev_device *device)
 	if (name == NULL)
 		return FALSE;
 
-	return g_str_has_prefix(name, "domain");
+	return g_str_has_prefix (name, "domain");
 }
 
 static void
@@ -105,13 +109,14 @@ fu_plugin_thunderbolt_add (FuPlugin *plugin, udev_device *device)
 	const gchar *uuid;
 	const gchar *vendor;
 	const gchar *version;
+	gboolean is_host;
+	guint16 did;
+	guint16 vid;
 	g_autofree gchar *id = NULL;
 	g_autofree gchar *vendor_id = NULL;
 	g_autofree gchar *device_id = NULL;
 	g_autoptr(FuDevice) dev = NULL;
-	gboolean is_host;
-	gboolean ok;
-	guint did, vid = 0x0;
+	g_autoptr(GError) error = NULL;
 
 	uuid = udev_device_get_sysattr_value (device, "unique_id");
 	if (uuid == NULL) {
@@ -119,7 +124,7 @@ fu_plugin_thunderbolt_add (FuPlugin *plugin, udev_device *device)
 		return;
 	}
 
-	g_debug ("adding udev device: %s @ %s",
+	g_debug ("adding udev device: %s at %s",
 		 uuid, udev_device_get_syspath (device));
 
 	id = fu_plugin_thunderbolt_gen_id (device);
@@ -129,44 +134,47 @@ fu_plugin_thunderbolt_add (FuPlugin *plugin, udev_device *device)
 		return;
 	}
 
-	ok = fu_plugin_thunderbolt_udev_get_id (device, "vendor", &vid);
-	if (!ok) {
+	vid = fu_plugin_thunderbolt_udev_get_id (device, "vendor", &error);
+	if (vid == 0x0) {
+		g_warning ("failed to get Vendor ID: %s", error->message);
+		return;
+	}
+	did = fu_plugin_thunderbolt_udev_get_id (device, "device", &error);
+	if (did == 0x0) {
+		g_warning ("failed to get Device ID: %s", error->message);
 		return;
 	}
 
-	ok = fu_plugin_thunderbolt_udev_get_id (device, "device", &did);
-	if (!ok) {
-		return;
-	}
-
-	name = udev_device_get_sysattr_value (device, "device_name");
-	vendor = udev_device_get_sysattr_value (device, "vendor_name");
-	version = udev_device_get_sysattr_value (device, "nvm_version");
 	is_host = fu_plugin_thunderbolt_is_host (device);
-	vendor_id = g_strdup_printf ("TBT:0x%04X", vid);
-	device_id = g_strdup_printf ("TBT-%04x%04x", vid, did);
+	vendor_id = g_strdup_printf ("TBT:0x%04X", (guint) vid);
+	device_id = g_strdup_printf ("TBT-%04x%04x", (guint) vid, (guint) did);
 
 	dev = fu_device_new ();
 	fu_device_set_id (dev, id);
 
-	if (is_host) {
-		g_autofree gchar *pretty_name = NULL;
-		pretty_name = g_strdup_printf ("%s Thunderbolt Controller", name);
-		fu_device_set_name (dev, pretty_name);
-	} else {
-		fu_device_set_name (dev, name);
+	name = udev_device_get_sysattr_value (device, "device_name");
+	if (name != NULL) {
+		if (is_host) {
+			g_autofree gchar *pretty_name = NULL;
+			pretty_name = g_strdup_printf ("%s Thunderbolt Controller", name);
+			fu_device_set_name (dev, pretty_name);
+		} else {
+			fu_device_set_name (dev, name);
+		}
 	}
 
-	fu_device_set_vendor (dev, vendor);
+	vendor = udev_device_get_sysattr_value (device, "vendor_name");
+	if (vendor != NULL)
+		fu_device_set_vendor (dev, vendor);
 	fu_device_set_vendor_id (dev, vendor_id);
 	fu_device_add_guid (dev, device_id);
-	fu_device_set_version (dev, version);
-
-	if (is_host)
-		fu_device_add_flag (dev, FWUPD_DEVICE_FLAG_INTERNAL);
-
+	version = udev_device_get_sysattr_value (device, "nvm_version");
+	if (version != NULL)
+		fu_device_set_version (dev, version);
 	fu_device_add_flag (dev, FWUPD_DEVICE_FLAG_ALLOW_ONLINE);
 	fu_device_add_flag (dev, FWUPD_DEVICE_FLAG_ALLOW_OFFLINE);
+	if (is_host)
+		fu_device_add_flag (dev, FWUPD_DEVICE_FLAG_INTERNAL);
 
 	fu_plugin_cache_add (plugin, id, dev);
 	fu_plugin_device_add_delay (plugin, dev);
@@ -214,12 +222,10 @@ udev_uevent_cb (GIOChannel   *source,
 {
 	FuPlugin *plugin = (FuPlugin *) user_data;
 	FuPluginData *data = fu_plugin_get_data (plugin);
-
-	g_autoptr(udev_device) device = NULL;
 	const char *action;
+	g_autoptr(udev_device) device = NULL;
 
 	device = udev_monitor_receive_device (data->monitor);
-
 	if (device == NULL)
 		return TRUE;
 
@@ -228,7 +234,6 @@ udev_uevent_cb (GIOChannel   *source,
 		return TRUE;
 
 	g_debug ("uevent for %s: %s", udev_device_get_syspath (device), action);
-
 	if (g_str_equal (action, "add")) {
 		fu_plugin_thunderbolt_add (plugin, device);
 	} else if (g_str_equal (action, "remove")) {
@@ -254,12 +259,11 @@ void
 fu_plugin_destroy (FuPlugin *plugin)
 {
 	FuPluginData *data = fu_plugin_get_data (plugin);
-	if (data->monitor) {
+	if (data->monitor != NULL) {
 		udev_monitor_unref (data->monitor);
 		g_source_destroy (data->monitor_source);
 		g_source_unref (data->monitor_source);
 	}
-
 	udev_unref (data->udev);
 }
 
@@ -267,14 +271,14 @@ gboolean
 fu_plugin_coldplug (FuPlugin *plugin, GError **error)
 {
 	FuPluginData *data = fu_plugin_get_data (plugin);
-	g_autoptr(udev_monitor) monitor = NULL;
-	g_autoptr(GIOChannel) channel = NULL;
 	struct udev_enumerate *enumerate;
 	struct udev_list_entry *l, *devices;
 	GSource *watch;
 	guint tag;
 	int fd;
 	int r;
+	g_autoptr(GIOChannel) channel = NULL;
+	g_autoptr(udev_monitor) monitor = NULL;
 
 	monitor = udev_monitor_new_from_netlink (data->udev, "udev");
 	if (monitor == NULL) {
@@ -306,7 +310,6 @@ fu_plugin_coldplug (FuPlugin *plugin, GError **error)
 	}
 
 	fd = udev_monitor_get_fd (monitor);
-
 	if (fd < 0) {
 		g_set_error_literal (error,
 				     FWUPD_ERROR,
@@ -334,14 +337,10 @@ fu_plugin_coldplug (FuPlugin *plugin, GError **error)
 
 	for (l = devices; l; l = udev_list_entry_get_next (l)) {
 		g_autoptr(udev_device) udevice = NULL;
-
 		udevice = udev_device_new_from_syspath (udev_enumerate_get_udev (enumerate),
 							udev_list_entry_get_name (l));
-
-		if (udevice == NULL) {
+		if (udevice == NULL)
 			continue;
-		}
-
 		fu_plugin_thunderbolt_add (plugin, udevice);
 	}
 
