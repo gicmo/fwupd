@@ -15,6 +15,7 @@ shared_module('fu_plugin_thunderbolt',
   dependencies : [
     plugin_deps,
     udev,
+    fwup,
   ],
 )
 
@@ -27,6 +28,7 @@ if get_option('enable-tests') and umockdev.found()
     'thunderbolt-self-test',
     sources : [
       'fu-self-test.c',
+      'fu-plugin-thunderbolt.c',
     ],
     include_directories : [
       include_directories('../..'),
@@ -35,6 +37,7 @@ if get_option('enable-tests') and umockdev.found()
     ],
     dependencies : [
       plugin_deps,
+      fwup,
       udev,
       umockdev,
     ],
