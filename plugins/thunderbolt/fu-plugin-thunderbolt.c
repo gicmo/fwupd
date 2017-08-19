@@ -304,7 +304,7 @@ udev_uevent_cb (GIOChannel   *source,
 static gboolean
 fu_plugin_thunderbolt_validate_firmware (GBytes *blob_fw, GError **error)
 {
-	/* noop */
+	/* FIXME: need to implement */
 	return TRUE;
 }
 
@@ -341,13 +341,12 @@ fu_plugin_thunderbolt_trigger_update (udev_device  *udevice,
 	const char *devpath;
 	int fd;
 	ssize_t n;
-	g_autofree char *auth_path = NULL;
+	g_autofree gchar *auth_path = NULL;
 
 	devpath = udev_device_get_syspath (udevice);
-	auth_path = g_build_filename(devpath, "nvm_authenticate", NULL);
+	auth_path = g_build_filename (devpath, "nvm_authenticate", NULL);
 
-	fd = open(auth_path, O_WRONLY | O_CLOEXEC);
-
+	fd = open (auth_path, O_WRONLY | O_CLOEXEC);
 	if (fd < 0) {
 		g_set_error (error, G_IO_ERROR,
 			     g_io_error_from_errno (errno),
@@ -356,7 +355,7 @@ fu_plugin_thunderbolt_trigger_update (udev_device  *udevice,
 		return FALSE;
 	}
 
-	for ( ; ; ) {
+	do {
 		n = write (fd, "1", 1);
 		if (n < 1 && errno != EINTR) {
 			g_set_error (error, G_IO_ERROR,
@@ -365,19 +364,17 @@ fu_plugin_thunderbolt_trigger_update (udev_device  *udevice,
 				     g_strerror (errno));
 			(void) close (fd);
 			return FALSE;
-		} else if (n > 0) {
-			break;
 		}
-	}
+	} while (n < 1);
 
 	(void) close (fd);
 	return TRUE;
 }
 
 static gboolean
-fu_plugin_thunderbolt_write_firmware ( udev_device *udevice,
-				       GBytes *blob_fw,
-				       GError **error)
+fu_plugin_thunderbolt_write_firmware (udev_device *udevice,
+				      GBytes *blob_fw,
+				      GError **error)
 {
 	gsize fw_size;
 	gsize nwritten;
@@ -387,9 +384,8 @@ fu_plugin_thunderbolt_write_firmware ( udev_device *udevice,
 
 	/* TODO: error propagation */
 	nvmem = fu_plugin_thunderbolt_find_nvmem (udevice, error);
-	if (nvmem == NULL) {
+	if (nvmem == NULL)
 		return FALSE;
-	}
 
 	os = (GOutputStream *) g_file_append_to (nvmem,
 						 G_FILE_CREATE_NONE,
@@ -424,7 +420,7 @@ fu_plugin_thunderbolt_write_firmware ( udev_device *udevice,
 	if (nwritten != fw_size) {
 		g_set_error_literal (error,
 				     FWUPD_ERROR,
-				     FWUPD_ERROR_NOT_SUPPORTED,
+				     FWUPD_ERROR_WRITE,
 				     "Could not write all data to nvmem");
 		return FALSE;
 	}
@@ -451,6 +447,73 @@ on_wait_for_device_timeout (gpointer user_data)
 }
 
 static void
+on_wait_for_device_added (FuPlugin    *plugin,
+			  udev_device *device,
+			  UpdateData *up_data)
+{
+	FuDevice  *dev;
+	const char *uuid;
+	const char *path;
+	const char *version;
+	g_autofree gchar *id = NULL;
+
+	uuid = udev_device_get_sysattr_value(device, "unique_id");
+	if (uuid == NULL)
+		return;
+
+	dev = g_hash_table_lookup(up_data->changes, uuid);
+	if (dev == NULL) {
+		/* a previously unknown device, add it via
+		 * the normal way */
+		fu_plugin_thunderbolt_add (plugin, device);
+		return;
+	}
+
+	/* maybe the device path has changed, lets make sure
+	 * it is correct */
+	path = udev_device_get_syspath (device);
+	fu_device_set_metadata (dev, "sysfs-path", path);
+
+	/* make sure the version is correct, might have changed
+	 * after update. */
+	version = udev_device_get_sysattr_value (device, "nvm_version");
+	fu_device_set_version (dev, version);
+
+	id = fu_plugin_thunderbolt_gen_id (device);
+	fu_plugin_cache_add (plugin, id, dev);
+
+	g_hash_table_remove (up_data->changes, uuid);
+
+	/* check if this device is the target*/
+	if (g_str_equal (uuid, up_data->target_uuid)) {
+		up_data->have_device = TRUE;
+		g_main_loop_quit (up_data->mainloop);
+	}
+}
+
+static void
+on_wait_for_device_removed (FuPlugin    *plugin,
+			    udev_device *device,
+			    UpdateData *up_data)
+{
+	g_autofree gchar *id = NULL;
+	FuDevice  *dev;
+	const char *uuid;
+
+	id = fu_plugin_thunderbolt_gen_id (device);
+	dev = fu_plugin_cache_lookup (plugin, id);
+
+	if (dev == NULL)
+		return;
+
+	fu_plugin_cache_remove (plugin, id);
+	uuid = fu_device_get_id (dev);
+	g_hash_table_insert (up_data->changes,
+			     (gpointer) uuid,
+			     g_object_ref (dev));
+}
+
+static void
 on_wait_for_device_notify (FuPlugin    *plugin,
 			   udev_device *device,
 			   const char  *action,
@@ -459,68 +522,12 @@ on_wait_for_device_notify (FuPlugin    *plugin,
 	UpdateData *up_data = (UpdateData *) user_data;
 
 	if (g_str_equal (action, "add")) {
-		FuDevice  *dev;
-		const char *uuid;
-		const char *path;
-		const char *version;
-		g_autofree gchar *id = NULL;
-
-		uuid = udev_device_get_sysattr_value(device, "unique_id");
-		if (uuid == NULL)
-			return;
-
-		g_debug (" [chagen-db] checking for %s", uuid);
-		dev = g_hash_table_lookup(up_data->changes, uuid);
-		if (dev == NULL) {
-			/* a previously unknown device, add it via
-			 * the normal way */
-			fu_plugin_thunderbolt_add (plugin, device);
-			return;
-		}
-
-		g_debug (" [chagen-db] HIT");
-		/* maybe the device path has changed, lets make sure
-		 * it is correct */
-		path = udev_device_get_syspath (device);
-		fu_device_set_metadata (dev, "sysfs-path", path);
-
-		/* make sure the version is correct, might have changed
-		 * after update. */
-		version = udev_device_get_sysattr_value (device, "nvm_version");
-		fu_device_set_version (dev, version);
-
-		id = fu_plugin_thunderbolt_gen_id (device);
-		fu_plugin_cache_add (plugin, id, dev);
-
-		g_hash_table_remove (up_data->changes, uuid);
-
-		/* check if this device is the target*/
-		if (g_str_equal (uuid, up_data->target_uuid)) {
-			up_data->have_device = TRUE;
-			g_main_loop_quit (up_data->mainloop);
-		}
-
+		on_wait_for_device_added (plugin, device, up_data);
 	} else if (g_str_equal (action, "remove")) {
-		g_autofree gchar *id = NULL;
-		FuDevice  *dev;
-		const char *uuid;
-
-		id = fu_plugin_thunderbolt_gen_id (device);
-		dev = fu_plugin_cache_lookup (plugin, id);
-
-		if (dev == NULL)
-			return;
-
-		fu_plugin_cache_remove (plugin, id);
-		uuid = fu_device_get_id (dev);
-		g_debug (" [chagen-db] inserting %s", uuid);
-		g_hash_table_insert (up_data->changes,
-				     (gpointer) uuid,
-				     g_object_ref (dev));
+		on_wait_for_device_removed (plugin, device, up_data);
 	} else if (g_str_equal (action, "change")) {
 		fu_plugin_thunderbolt_change (plugin, device);
 	}
-
 }
 
 static void
@@ -564,7 +571,7 @@ fu_plugin_thunderbolt_wait_for_device (FuPlugin  *plugin,
 	data->update_data = &up_data;
 	data->update_notify = on_wait_for_device_notify;
 
-	changes = g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_object_unref);
+	changes = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, g_object_unref);
 	up_data.changes = changes;
 
 	/* now we wait ... */
@@ -694,18 +701,18 @@ fu_plugin_update_online (FuPlugin *plugin,
 {
 	FuPluginData *data = fu_plugin_get_data (plugin);
 	const char *devpath;
-	gboolean ok;
+	gboolean ret;
 	guint64 status;
 	g_autoptr(udev_device) udevice = NULL;
-	g_autoptr(GError) my_error = NULL;
+	g_autoptr(GError) error_local = NULL;
 
-	ok = fu_plugin_thunderbolt_validate_firmware (blob_fw, &my_error);
-	if (!ok) {
+	ret = fu_plugin_thunderbolt_validate_firmware (blob_fw, &error_local);
+	if (!ret) {
 		g_set_error (error,
 			     FWUPD_ERROR,
 			     FWUPD_ERROR_NOT_FOUND,
 			     "could not validate firmware: %s",
-			     my_error->message);
+			     error_local->message);
 		return FALSE;
 	}
 
@@ -723,23 +730,23 @@ fu_plugin_update_online (FuPlugin *plugin,
 	}
 
 	fu_plugin_set_status (plugin, FWUPD_STATUS_DEVICE_WRITE);
-	ok = fu_plugin_thunderbolt_write_firmware (udevice, blob_fw, &my_error);
-	if (!ok) {
+	ret = fu_plugin_thunderbolt_write_firmware (udevice, blob_fw, &error_local);
+	if (!ret) {
 		g_set_error (error,
 			     FWUPD_ERROR,
-			     FWUPD_ERROR_NOT_FOUND,
+			     FWUPD_ERROR_WRITE,
 			     "could not write firmware to thunderbolt device at %s: %s",
-			     devpath, my_error->message);
+			     devpath, error_local->message);
 		return FALSE;
 	}
 
-	ok = fu_plugin_thunderbolt_trigger_update (udevice, &my_error);
-	if (!ok) {
+	ret = fu_plugin_thunderbolt_trigger_update (udevice, &error_local);
+	if (!ret) {
 		g_set_error (error,
 			     FWUPD_ERROR,
 			     FWUPD_ERROR_NOT_SUPPORTED,
 			     "Could not start thunderbolt device upgrade: %s",
-			     my_error->message);
+			     error_local->message);
 		return FALSE;
 	}
 
@@ -747,27 +754,29 @@ fu_plugin_update_online (FuPlugin *plugin,
 
 	/* the device will disappear and we need to wait until it reappears,
 	 * and then check if we find an error */
-	ok = fu_plugin_thunderbolt_wait_for_device (plugin,
+	ret = fu_plugin_thunderbolt_wait_for_device (plugin,
 						    dev,
 						    FU_PLUGIN_THUNDERBOLT_UPDATE_TIMEOUT_MS,
-						    &my_error);
-	if (!ok) {
+						    &error_local);
+	if (!ret) {
 		g_set_error (error,
 			     FWUPD_ERROR,
 			     FWUPD_ERROR_NOT_FOUND,
 			     "could not detect device after update: %s",
-			     my_error->message);
+			     error_local->message);
 		return FALSE;
 	}
 
 	/* now check if the update actually worked */
-	status = udev_device_get_sysattr_guint64 (udevice, "nvm_authenticate", &my_error);
+	status = udev_device_get_sysattr_guint64 (udevice, "nvm_authenticate", &error_local);
 
-	if (!(ok = (status == 0x0)))
+	/* anything else then 0x0 means we got an error */
+	ret = status == 0x0;
+	if (ret == FALSE)
 		g_set_error (error,
 			     FWUPD_ERROR,
 			     FWUPD_ERROR_INTERNAL,
-			     "update failed (status %lx)", status);
+			     "update failed (status %" G_GINT64_MODIFIER "x)", status);
 
-	return ok;
+	return ret;
 }
