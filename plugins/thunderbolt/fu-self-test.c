@@ -267,6 +267,50 @@ mock_tree_dump (const MockTree *node, int level)
 	}
 }
 
+static void
+mock_tree_firmware_verify (const MockTree *node, GBytes *data)
+{
+	g_autoptr(GFile) nvm_device = NULL;
+	g_autoptr(GFile) nvm = NULL;
+	g_autoptr(GInputStream) is = NULL;
+	g_autoptr(GChecksum) chk = NULL;
+	g_autoptr(GError) error = NULL;
+	g_autofree gchar *sum_data = NULL;
+	const gchar *sum_disk = NULL;
+	gsize s;
+
+	sum_data = g_compute_checksum_for_bytes (G_CHECKSUM_SHA1, data);
+	chk = g_checksum_new (G_CHECKSUM_SHA1);
+
+	g_assert_nonnull (node);
+	g_assert_nonnull (node->nvm_device);
+
+	nvm_device = g_file_new_for_path (node->nvm_device);
+	nvm = g_file_get_child (nvm_device, "nvmem");
+
+	is = (GInputStream *) g_file_read (nvm, NULL, &error);
+	g_assert_no_error (error);
+	g_assert_nonnull (is);
+
+	do {
+		g_autoptr(GBytes) b = NULL;
+		const guchar *d;
+
+		b = g_input_stream_read_bytes (is, 4096, NULL, &error);
+		g_assert_no_error (error);
+		g_assert_nonnull (is);
+
+		d = g_bytes_get_data (b, &s);
+		if (s > 0)
+			g_checksum_update (chk, d, (gssize) s);
+
+	} while (s > 0);
+
+	sum_disk = g_checksum_get_string (chk);
+
+	g_assert_cmpstr (sum_data, ==, sum_disk);
+}
+
 typedef gboolean (* MockTreePredicate) (const MockTree *node, gpointer data);
 
 static const MockTree *
@@ -511,6 +555,7 @@ typedef struct UpdateContext {
 
 	guint result;
 	guint timeout;
+	GBytes *data;
 	UMockdevTestbed *bed;
 	FuPlugin *plugin;
 
@@ -527,6 +572,7 @@ update_context_free (UpdateContext *ctx)
 	g_object_unref (ctx->bed);
 	g_object_unref (ctx->plugin);
 	g_object_unref (ctx->monitor);
+	g_bytes_unref (ctx->data);
 	g_free (ctx->version);
 	g_free (ctx);
 }
@@ -571,6 +617,9 @@ udev_file_changed_cb (GFileMonitor     *monitor,
 	if (!g_str_has_prefix (data, "1"))
 		return;
 
+	/* verify the firmware is correct */
+	mock_tree_firmware_verify (ctx->node, ctx->data);
+
 	g_debug ("Removing tree below and including: %s", ctx->node->path);
 	mock_tree_detach (ctx->node);
 
@@ -583,10 +632,11 @@ udev_file_changed_cb (GFileMonitor     *monitor,
 }
 
 static UpdateContext *
-mock_tree_prepare_for_update (MockTree        *node,
-			      FuPlugin        *plugin,
-			      const char      *version,
-			      guint            timeout_ms)
+mock_tree_prepare_for_update (MockTree    *node,
+			      FuPlugin    *plugin,
+			      const char  *version,
+			      GBytes      *fw_data,
+			      guint        timeout_ms)
 {
 	UpdateContext *ctx;
 	g_autoptr(GFile) dir = NULL;
@@ -608,6 +658,7 @@ mock_tree_prepare_for_update (MockTree        *node,
 	ctx->timeout = timeout_ms;
 	ctx->monitor = monitor;
 	ctx->version = g_strdup (version);
+	ctx->data = g_bytes_ref (fw_data);
 
 	g_signal_connect (monitor, "changed",
 			  G_CALLBACK (udev_file_changed_cb), ctx);
@@ -734,7 +785,7 @@ test_update_working (ThunderboltTest *tt, gconstpointer user_data)
 
 	/* simulate an update, where the device goes away and comes back
 	 * after the time in the last parameter (given in ms) */
-	up_ctx = mock_tree_prepare_for_update (tree, plugin, "42.23", 1000);
+	up_ctx = mock_tree_prepare_for_update (tree, plugin, "42.23", fw_data, 1000);
 	ret = fu_plugin_runner_update (plugin, tree->fu_device, NULL, fw_data, 0, &error);
 	g_assert_no_error (error);
 	g_assert_true (ret);
