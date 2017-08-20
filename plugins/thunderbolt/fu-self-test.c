@@ -420,29 +420,37 @@ mock_tree_plugin_device_added (FuPlugin *plugin, FuDevice *device, gpointer user
 	}
 }
 
-
 static gboolean
-mock_tree_attach (MockTree *root, UMockdevTestbed *bed, FuPlugin *plugin)
+mock_tree_settle (MockTree *root, FuPlugin *plugin)
 {
 	g_autoptr(GMainLoop) mainloop = g_main_loop_new (NULL, FALSE);
+	gulong id;
 	AttachContext ctx = {
 		.tree = root,
 		.loop = mainloop,
 	};
 
+	id = g_signal_connect (plugin, "device-added",
+			       G_CALLBACK (mock_tree_plugin_device_added),
+			       &ctx);
+
+	g_main_loop_run (mainloop);
+	g_signal_handler_disconnect (plugin, id);
+
+	return ctx.complete;
+}
+
+
+static gboolean
+mock_tree_attach (MockTree *root, UMockdevTestbed *bed, FuPlugin *plugin)
+{
 	root->bed = g_object_ref (bed);
 	root->sysfs_parent = udev_mock_add_domain (bed, root->device->domain_id);
 	g_assert_nonnull (root->sysfs_parent);
 
 	g_timeout_add (root->device->delay_ms, mock_tree_attach_device, root);
 
-	g_signal_connect (plugin, "device-added",
-			  G_CALLBACK (mock_tree_plugin_device_added),
-			  &ctx);
-
-	g_main_loop_run (mainloop);
-
-	return ctx.complete;
+	return mock_tree_settle (root, plugin);
 }
 
 /* the unused parameter makes the function signature compatible
@@ -724,7 +732,9 @@ test_update_working (ThunderboltTest *tt, gconstpointer user_data)
 	g_assert_no_error (error);
 	g_assert_nonnull (fw_data);
 
-	up_ctx = mock_tree_prepare_for_update (tree, plugin, "42.23", 2*1000);
+	/* simulate an update, where the device goes away and comes back
+	 * after the time in the last parameter (given in ms) */
+	up_ctx = mock_tree_prepare_for_update (tree, plugin, "42.23", 1000);
 	ret = fu_plugin_runner_update (plugin, tree->fu_device, NULL, fw_data, 0, &error);
 	g_assert_no_error (error);
 	g_assert_true (ret);
@@ -732,6 +742,17 @@ test_update_working (ThunderboltTest *tt, gconstpointer user_data)
 	version_after = fu_device_get_version (tree->fu_device);
 	g_debug ("version after update: %s", version_after);
 	g_assert_cmpstr (version_after, ==, "42.23");
+
+	/* we wait until the plugin has picked up  all the
+	 * subtree changes */
+	ret = mock_tree_settle (tree, plugin);
+	g_assert_true (ret);
+
+	/* now we check if the every tree node has a corresponding FuDevice,
+	 * this implicitly checks that we are handling uevents correctly
+	 * after the event, and that we are in sync with the udev tree */
+	ret = mock_tree_all (tree, mock_tree_node_have_fu_device, NULL);
+	g_assert_true (ret);
 }
 
 int

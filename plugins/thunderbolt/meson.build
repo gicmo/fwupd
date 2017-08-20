@@ -14,7 +14,7 @@ shared_module('fu_plugin_thunderbolt',
   c_args : cargs,
   dependencies : [
     plugin_deps,
-    udev,
+    gudev,
     fwup,
   ],
 )
@@ -38,7 +38,7 @@ if get_option('enable-tests') and umockdev.found()
     dependencies : [
       plugin_deps,
       fwup,
-      udev,
+      gudev,
       umockdev,
     ],
     link_with : [

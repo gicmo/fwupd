@@ -28,31 +28,22 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <libudev.h>
 #include <gio/gio.h>
 #include <glib.h>
-
+#include <gudev/gudev.h>
 
 #include "fu-plugin.h"
 #include "fu-plugin-vfuncs.h"
 
-typedef struct udev_monitor udev_monitor;
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(udev_monitor, udev_monitor_unref);
-
-typedef struct udev_device udev_device;
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(udev_device, udev_device_unref);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(GUdevDevice, g_object_unref)
 
 typedef void (*UEventNotify) (FuPlugin	  *plugin,
-			      udev_device *udevice,
-			      const char  *action,
+			      GUdevDevice *udevice,
+			      const gchar *action,
 			      gpointer     user_data);
 
 struct FuPluginData {
-	struct udev	*udev;
-	udev_monitor	*monitor;
-	int		 monitor_fd;
-	GSource		*monitor_source;
-	guint		 monitor_tag;
+	GUdevClient     *udev;
 
 	/* in the case we are updating */
 	UEventNotify     update_notify;
@@ -61,7 +52,7 @@ struct FuPluginData {
 
 
 static gchar *
-fu_plugin_thunderbolt_gen_id_from_syspath (const char *syspath)
+fu_plugin_thunderbolt_gen_id_from_syspath (const gchar *syspath)
 {
 	gchar *id;
 	id = g_strdup_printf ("tbt-%s", syspath);
@@ -71,21 +62,21 @@ fu_plugin_thunderbolt_gen_id_from_syspath (const char *syspath)
 
 
 static gchar *
-fu_plugin_thunderbolt_gen_id (struct udev_device *device)
+fu_plugin_thunderbolt_gen_id (GUdevDevice *device)
 {
-	const char *syspath = udev_device_get_syspath (device);
+	const gchar *syspath = g_udev_device_get_sysfs_path (device);
 	return fu_plugin_thunderbolt_gen_id_from_syspath (syspath);
 }
 
 static guint64
-udev_device_get_sysattr_guint64 (udev_device *device,
-				 const char *name,
+udev_device_get_sysattr_guint64 (GUdevDevice *device,
+				 const gchar *name,
 				 GError **error)
 {
-	const char *sysfs;
+	const gchar *sysfs;
 	guint64 val;
 
-	sysfs = udev_device_get_sysattr_value (device, name);
+	sysfs = g_udev_device_get_sysfs_attr (device, name);
 	if (sysfs == NULL) {
 		g_set_error (error,
 			     FWUPD_ERROR,
@@ -107,8 +98,8 @@ udev_device_get_sysattr_guint64 (udev_device *device,
 }
 
 static guint16
-fu_plugin_thunderbolt_udev_get_id (udev_device *device,
-				   const char *name,
+fu_plugin_thunderbolt_udev_get_id (GUdevDevice *device,
+				   const gchar *name,
 				   GError **error)
 {
 
@@ -130,16 +121,16 @@ fu_plugin_thunderbolt_udev_get_id (udev_device *device,
 }
 
 static gboolean
-fu_plugin_thunderbolt_is_host (udev_device *device)
+fu_plugin_thunderbolt_is_host (GUdevDevice *device)
 {
-	udev_device *parent; /* memory belongs to the child */
-	const char *name;
+	g_autoptr(GUdevDevice) parent = NULL;
+	const gchar *name;
 
 	/* the (probably safe) assumption this code makes is
 	 * that the thunderbolt device which is a direct child
 	 * of the domain is the host controller device itself */
-	parent = udev_device_get_parent (device);
-	name = udev_device_get_sysname (parent);
+	parent = g_udev_device_get_parent (device);
+	name = g_udev_device_get_name (parent);
 	if (name == NULL)
 		return FALSE;
 
@@ -147,7 +138,7 @@ fu_plugin_thunderbolt_is_host (udev_device *device)
 }
 
 static void
-fu_plugin_thunderbolt_add (FuPlugin *plugin, udev_device *device)
+fu_plugin_thunderbolt_add (FuPlugin *plugin, GUdevDevice *device)
 {
 	FuDevice *dev_tmp;
 	const gchar *name;
@@ -164,13 +155,14 @@ fu_plugin_thunderbolt_add (FuPlugin *plugin, udev_device *device)
 	g_autoptr(FuDevice) dev = NULL;
 	g_autoptr(GError) error = NULL;
 
-	uuid = udev_device_get_sysattr_value (device, "unique_id");
+	uuid = g_udev_device_get_sysfs_attr (device, "unique_id");
 	if (uuid == NULL) {
 		/* most likely the domain itself, ignore */
+		/* TODO: handle devices in safe-mode */
 		return;
 	}
 
-	devpath = udev_device_get_syspath (device);
+	devpath = g_udev_device_get_sysfs_path (device);
 
 	g_debug ("adding udev device: %s at %s", uuid, devpath);
 
@@ -200,7 +192,7 @@ fu_plugin_thunderbolt_add (FuPlugin *plugin, udev_device *device)
 	fu_device_set_id (dev, uuid);
 
 	fu_device_set_metadata(dev, "sysfs-path", devpath);
-	name = udev_device_get_sysattr_value (device, "device_name");
+	name = g_udev_device_get_sysfs_attr (device, "device_name");
 	if (name != NULL) {
 		if (is_host) {
 			g_autofree gchar *pretty_name = NULL;
@@ -211,12 +203,12 @@ fu_plugin_thunderbolt_add (FuPlugin *plugin, udev_device *device)
 		}
 	}
 
-	vendor = udev_device_get_sysattr_value (device, "vendor_name");
+	vendor = g_udev_device_get_sysfs_attr (device, "vendor_name");
 	if (vendor != NULL)
 		fu_device_set_vendor (dev, vendor);
 	fu_device_set_vendor_id (dev, vendor_id);
 	fu_device_add_guid (dev, device_id);
-	version = udev_device_get_sysattr_value (device, "nvm_version");
+	version = g_udev_device_get_sysfs_attr (device, "nvm_version");
 	if (version != NULL)
 		fu_device_set_version (dev, version);
 	fu_device_add_flag (dev, FWUPD_DEVICE_FLAG_ALLOW_ONLINE);
@@ -229,7 +221,7 @@ fu_plugin_thunderbolt_add (FuPlugin *plugin, udev_device *device)
 }
 
 static void
-fu_plugin_thunderbolt_remove (FuPlugin *plugin, udev_device *device)
+fu_plugin_thunderbolt_remove (FuPlugin *plugin, GUdevDevice *device)
 {
 	FuDevice *dev;
 	g_autofree gchar *id = NULL;
@@ -244,7 +236,7 @@ fu_plugin_thunderbolt_remove (FuPlugin *plugin, udev_device *device)
 }
 
 static void
-fu_plugin_thunderbolt_change (FuPlugin *plugin, udev_device *device)
+fu_plugin_thunderbolt_change (FuPlugin *plugin, GUdevDevice *device)
 {
 	FuDevice *dev;
 	const gchar *version;
@@ -259,29 +251,23 @@ fu_plugin_thunderbolt_change (FuPlugin *plugin, udev_device *device)
 	}
 
 	fu_plugin_device_remove (plugin, dev);
-	version = udev_device_get_sysattr_value (device, "nvm_version");
+	version = g_udev_device_get_sysfs_attr (device, "nvm_version");
 	fu_device_set_version (dev, version);
 }
 
 static gboolean
-udev_uevent_cb (GIOChannel   *source,
-		GIOCondition  condition,
-		gpointer      user_data)
+udev_uevent_cb (GUdevClient *udev,
+		const gchar *action,
+		GUdevDevice *device,
+		gpointer     user_data)
 {
 	FuPlugin *plugin = (FuPlugin *) user_data;
 	FuPluginData *data = fu_plugin_get_data (plugin);
-	const char *action;
-	g_autoptr(udev_device) device = NULL;
 
-	device = udev_monitor_receive_device (data->monitor);
-	if (device == NULL)
-		return TRUE;
-
-	action = udev_device_get_action (device);
 	if (action == NULL)
 		return TRUE;
 
-	g_debug ("uevent for %s: %s", udev_device_get_syspath (device), action);
+	g_debug ("uevent for %s: %s", g_udev_device_get_sysfs_path (device), action);
 
 	if (data->update_notify != NULL) {
 		g_debug ("using update notify handler for uevent");
@@ -309,24 +295,24 @@ fu_plugin_thunderbolt_validate_firmware (GBytes *blob_fw, GError **error)
 }
 
 static GFile *
-fu_plugin_thunderbolt_find_nvmem (udev_device  *udevice,
+fu_plugin_thunderbolt_find_nvmem (GUdevDevice  *udevice,
 				  GError      **error)
 {
-	const char *devpath;
-	const char *name;
+	const gchar *devpath;
+	const gchar *name;
 	g_autoptr(GDir) d;
 
-	devpath = udev_device_get_syspath (udevice);
+	devpath = g_udev_device_get_sysfs_path (udevice);
 
 	d = g_dir_open (devpath, 0, error);
 	if (d == NULL)
 		return NULL;
 
 	while ((name = g_dir_read_name (d)) != NULL) {
-		if (g_str_has_prefix(name, "nvm_non_active")) {
-			g_autoptr(GFile) parent = g_file_new_for_path(devpath);
-			g_autoptr(GFile) nvm_dir =g_file_get_child(parent, name);
-			return g_file_get_child(nvm_dir, "nvmem");
+		if (g_str_has_prefix (name, "nvm_non_active")) {
+			g_autoptr(GFile) parent = g_file_new_for_path (devpath);
+			g_autoptr(GFile) nvm_dir =g_file_get_child (parent, name);
+			return g_file_get_child (nvm_dir, "nvmem");
 		}
 	}
 
@@ -334,16 +320,16 @@ fu_plugin_thunderbolt_find_nvmem (udev_device  *udevice,
 }
 
 static gboolean
-fu_plugin_thunderbolt_trigger_update (udev_device  *udevice,
+fu_plugin_thunderbolt_trigger_update (GUdevDevice  *udevice,
 				      GError      **error)
 {
 
-	const char *devpath;
+	const gchar *devpath;
 	int fd;
 	ssize_t n;
 	g_autofree gchar *auth_path = NULL;
 
-	devpath = udev_device_get_syspath (udevice);
+	devpath = g_udev_device_get_sysfs_path (udevice);
 	auth_path = g_build_filename (devpath, "nvm_authenticate", NULL);
 
 	fd = open (auth_path, O_WRONLY | O_CLOEXEC);
@@ -372,9 +358,9 @@ fu_plugin_thunderbolt_trigger_update (udev_device  *udevice,
 }
 
 static gboolean
-fu_plugin_thunderbolt_write_firmware (udev_device *udevice,
-				      GBytes *blob_fw,
-				      GError **error)
+fu_plugin_thunderbolt_write_firmware (GUdevDevice  *udevice,
+				      GBytes       *blob_fw,
+				      GError      **error)
 {
 	gsize fw_size;
 	gsize nwritten;
@@ -432,7 +418,7 @@ typedef struct UpdateData {
 
 	gboolean   have_device;
 	GMainLoop *mainloop;
-	const char *target_uuid;
+	const gchar *target_uuid;
 	guint      timeout_id;
 
 	GHashTable *changes;
@@ -448,20 +434,20 @@ on_wait_for_device_timeout (gpointer user_data)
 
 static void
 on_wait_for_device_added (FuPlugin    *plugin,
-			  udev_device *device,
-			  UpdateData *up_data)
+			  GUdevDevice *device,
+			  UpdateData  *up_data)
 {
 	FuDevice  *dev;
-	const char *uuid;
-	const char *path;
-	const char *version;
+	const gchar *uuid;
+	const gchar *path;
+	const gchar *version;
 	g_autofree gchar *id = NULL;
 
-	uuid = udev_device_get_sysattr_value(device, "unique_id");
+	uuid = g_udev_device_get_sysfs_attr (device, "unique_id");
 	if (uuid == NULL)
 		return;
 
-	dev = g_hash_table_lookup(up_data->changes, uuid);
+	dev = g_hash_table_lookup (up_data->changes, uuid);
 	if (dev == NULL) {
 		/* a previously unknown device, add it via
 		 * the normal way */
@@ -471,12 +457,12 @@ on_wait_for_device_added (FuPlugin    *plugin,
 
 	/* maybe the device path has changed, lets make sure
 	 * it is correct */
-	path = udev_device_get_syspath (device);
+	path = g_udev_device_get_sysfs_path (device);
 	fu_device_set_metadata (dev, "sysfs-path", path);
 
 	/* make sure the version is correct, might have changed
 	 * after update. */
-	version = udev_device_get_sysattr_value (device, "nvm_version");
+	version = g_udev_device_get_sysfs_attr (device, "nvm_version");
 	fu_device_set_version (dev, version);
 
 	id = fu_plugin_thunderbolt_gen_id (device);
@@ -487,18 +473,19 @@ on_wait_for_device_added (FuPlugin    *plugin,
 	/* check if this device is the target*/
 	if (g_str_equal (uuid, up_data->target_uuid)) {
 		up_data->have_device = TRUE;
+		g_debug ("target (%s) re-appeared", uuid);
 		g_main_loop_quit (up_data->mainloop);
 	}
 }
 
 static void
 on_wait_for_device_removed (FuPlugin    *plugin,
-			    udev_device *device,
+			    GUdevDevice *device,
 			    UpdateData *up_data)
 {
 	g_autofree gchar *id = NULL;
 	FuDevice  *dev;
-	const char *uuid;
+	const gchar *uuid;
 
 	id = fu_plugin_thunderbolt_gen_id (device);
 	dev = fu_plugin_cache_lookup (plugin, id);
@@ -511,11 +498,18 @@ on_wait_for_device_removed (FuPlugin    *plugin,
 	g_hash_table_insert (up_data->changes,
 			     (gpointer) uuid,
 			     g_object_ref (dev));
+
+	/* check if this device is the target*/
+	if (g_str_equal (uuid, up_data->target_uuid)) {
+		up_data->have_device = FALSE;
+		g_debug ("target (%s) disappeared",
+			 uuid);
+	}
 }
 
 static void
 on_wait_for_device_notify (FuPlugin    *plugin,
-			   udev_device *device,
+			   GUdevDevice *device,
 			   const char  *action,
 			   gpointer    user_data)
 {
@@ -537,7 +531,7 @@ remove_leftover_devices (gpointer key,
 {
 	FuPlugin  *plugin = (FuPlugin *) user_data;
 	FuDevice *dev = (FuDevice *) value;
-	const char *syspath = fu_device_get_metadata (dev, "sysfs-path");
+	const gchar *syspath = fu_device_get_metadata (dev, "sysfs-path");
 	g_autofree gchar *id = NULL;
 
 	id = fu_plugin_thunderbolt_gen_id_from_syspath (syspath);
@@ -553,7 +547,7 @@ fu_plugin_thunderbolt_wait_for_device (FuPlugin  *plugin,
 				       GError   **error)
 {
 	FuPluginData *data = fu_plugin_get_data (plugin);
-	UpdateData    up_data = { FALSE, };
+	UpdateData    up_data = { TRUE, };
 	g_autoptr(GMainLoop) mainloop = NULL;
 	g_autoptr(GHashTable) changes = NULL;
 
@@ -577,6 +571,10 @@ fu_plugin_thunderbolt_wait_for_device (FuPlugin  *plugin,
 	/* now we wait ... */
 	g_main_loop_run (mainloop);
 
+	/* restore original udev change handler */
+	data->update_data = NULL;
+	data->update_notify = NULL;
+
 	if (!up_data.have_device) {
 		g_set_error_literal (error,
 				     FWUPD_ERROR,
@@ -595,97 +593,34 @@ void
 fu_plugin_init (FuPlugin *plugin)
 {
 	FuPluginData *data = fu_plugin_alloc_data (plugin, sizeof (FuPluginData));
-	data->udev = udev_new ();
+	const gchar *subsystems[] = { "thunderbolt", NULL };
+
+	data->udev = g_udev_client_new (subsystems);
+	g_signal_connect (data->udev, "uevent",
+			  G_CALLBACK (udev_uevent_cb), plugin);
 }
 
 void
 fu_plugin_destroy (FuPlugin *plugin)
 {
 	FuPluginData *data = fu_plugin_get_data (plugin);
-	if (data->monitor != NULL) {
-		udev_monitor_unref (data->monitor);
-		g_source_destroy (data->monitor_source);
-		g_source_unref (data->monitor_source);
-	}
-	udev_unref (data->udev);
+	g_object_unref (data->udev);
 }
 
 gboolean
 fu_plugin_coldplug (FuPlugin *plugin, GError **error)
 {
 	FuPluginData *data = fu_plugin_get_data (plugin);
-	struct udev_enumerate *enumerate;
-	struct udev_list_entry *l, *devices;
-	GSource *watch;
-	guint tag;
-	int fd;
-	int r;
-	g_autoptr(GIOChannel) channel = NULL;
-	g_autoptr(udev_monitor) monitor = NULL;
+	GList *devices, *l;
 
-	monitor = udev_monitor_new_from_netlink (data->udev, "udev");
-	if (monitor == NULL) {
-		g_set_error_literal (error,
-				     FWUPD_ERROR,
-				     FWUPD_ERROR_INTERNAL,
-				     "udev: could not create monitor");
-		return FALSE;
+	devices = g_udev_client_query_by_subsystem (data->udev, "thunderbolt");
+	for (l = devices; l != NULL; l = l->next) {
+		GUdevDevice *device = l->data;
+		fu_plugin_thunderbolt_add (plugin, device);
 	}
 
-	udev_monitor_set_receive_buffer_size (monitor, 128*1024*1024);
-
-	r = udev_monitor_filter_add_match_subsystem_devtype (monitor, "thunderbolt", NULL);
-	if (r < 0) {
-		g_set_error_literal (error,
-				     FWUPD_ERROR,
-				     FWUPD_ERROR_INTERNAL,
-				     "udev: could not add match for 'thunderbolt' to monitor");
-		return FALSE;
-	}
-
-	r = udev_monitor_enable_receiving (monitor);
-	if (r < 0) {
-		g_set_error_literal (error,
-				     FWUPD_ERROR,
-				     FWUPD_ERROR_INTERNAL,
-				     "udev: could not enable monitoring");
-		return FALSE;
-	}
-
-	fd = udev_monitor_get_fd (monitor);
-	if (fd < 0) {
-		g_set_error_literal (error,
-				     FWUPD_ERROR,
-				     FWUPD_ERROR_INTERNAL,
-				     "udev: could not obtain fd for monitoring");
-		return FALSE;
-	}
-
-	channel = g_io_channel_unix_new (fd);
-	watch = g_io_create_watch (channel, G_IO_IN);
-
-	g_source_set_callback (watch, (GSourceFunc) udev_uevent_cb, plugin, NULL);
-	tag = g_source_attach (watch, g_main_context_get_thread_default ());
-
-	data->monitor = udev_monitor_ref (monitor);
-	data->monitor_fd = fd;
-	data->monitor_tag = tag;
-	data->monitor_source = watch;
-	/* channel will be auto-unref'ed on func exit */
-
-	enumerate = udev_enumerate_new (data->udev);
-	udev_enumerate_add_match_subsystem (enumerate, "thunderbolt");
-	udev_enumerate_scan_devices (enumerate);
-	devices = udev_enumerate_get_list_entry (enumerate);
-
-	for (l = devices; l; l = udev_list_entry_get_next (l)) {
-		g_autoptr(udev_device) udevice = NULL;
-		udevice = udev_device_new_from_syspath (udev_enumerate_get_udev (enumerate),
-							udev_list_entry_get_name (l));
-		if (udevice == NULL)
-			continue;
-		fu_plugin_thunderbolt_add (plugin, udevice);
-	}
+	g_list_foreach (devices, (GFunc) g_object_unref, NULL);
+	g_list_free (devices);
 
 	return TRUE;
 }
@@ -700,10 +635,10 @@ fu_plugin_update_online (FuPlugin *plugin,
 			 GError **error)
 {
 	FuPluginData *data = fu_plugin_get_data (plugin);
-	const char *devpath;
+	const gchar *devpath;
 	gboolean ret;
 	guint64 status;
-	g_autoptr(udev_device) udevice = NULL;
+	g_autoptr(GUdevDevice) udevice = NULL;
 	g_autoptr(GError) error_local = NULL;
 
 	ret = fu_plugin_thunderbolt_validate_firmware (blob_fw, &error_local);
@@ -719,7 +654,7 @@ fu_plugin_update_online (FuPlugin *plugin,
 	devpath = fu_device_get_metadata (dev, "sysfs-path");
 	g_return_val_if_fail (devpath, FALSE);
 
-	udevice = udev_device_new_from_syspath (data->udev, devpath);
+	udevice = g_udev_client_query_by_sysfs_path (data->udev, devpath);
 	if (udevice == NULL) {
 		g_set_error (error,
 			     FWUPD_ERROR,

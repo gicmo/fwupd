@@ -191,7 +191,6 @@ if get_option('enable-tbtfwu')
 endif
 
 if get_option('enable-thunderbolt')
-  udev = dependency('libudev')
   umockdev = dependency('umockdev-1.0', required: false)
 endif
 
