@@ -22,8 +22,9 @@ shared_module('fu_plugin_thunderbolt',
 if get_option('enable-tests') and umockdev.found()
   cargs += '-DFU_OFFLINE_DESTDIR="/tmp/fwupd-self-test"'
   cargs += '-DPLUGINBUILDDIR="' + meson.current_build_dir() + '"'
-  testdatadir = join_paths(meson.current_source_dir(), 'tests')
-  cargs += '-DTESTDATADIR="' + testdatadir + '"'
+  testdatadir_src = join_paths(meson.source_root(), 'data', 'tests')
+  testdatadir_dst = join_paths(meson.build_root(), 'data', 'tests')
+  cargs += '-DTESTDATADIR="' + testdatadir_src + ':' + testdatadir_dst + '"'
   e = executable(
     'thunderbolt-self-test',
     sources : [

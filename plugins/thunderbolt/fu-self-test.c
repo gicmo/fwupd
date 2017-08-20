@@ -40,6 +40,7 @@
 #include <locale.h>
 
 #include "fu-plugin-private.h"
+#include "fu-test.h"
 
 typedef struct ThunderboltTest {
 	UMockdevTestbed *bed;
@@ -667,6 +668,7 @@ mock_tree_prepare_for_update (MockTree    *node,
 }
 
 
+
 static MockDevice root_one = {
 
 	.name = "Laptop",
@@ -757,17 +759,18 @@ test_tree (ThunderboltTest *tt, gconstpointer user_data)
 }
 
 
-static char mock_fw[] = "My cool firmware 23 42";
 static void
 test_update_working (ThunderboltTest *tt, gconstpointer user_data)
 {
 	FuPlugin *plugin = tt->plugin;
 	gboolean ret;
 	const gchar *version_after;
+	g_autofree gchar *fw_path = NULL;
 	g_autoptr(MockTree) tree = NULL;
 	g_autoptr(GError) error = NULL;
 	g_autoptr(GBytes) fw_data = NULL;
 	g_autoptr(UpdateContext) up_ctx = NULL;
+	g_autoptr(GMappedFile) fw_file = NULL;
 
 	tree = mock_tree_init (&root_one);
 	g_assert_nonnull (tree);
@@ -779,9 +782,14 @@ test_update_working (ThunderboltTest *tt, gconstpointer user_data)
 	ret = mock_tree_attach (tree, tt->bed, tt->plugin);
 	g_assert_true (ret);
 
-	fw_data = g_bytes_new_static (mock_fw, strlen (mock_fw));
+	/* we just want a biggish binary blob for now */
+	fw_path = fu_test_get_filename (TESTDATADIR, "colorhug/firmware.bin");
+	g_assert_nonnull (fw_path);
+	fw_file = g_mapped_file_new (fw_path, FALSE, &error);
 	g_assert_no_error (error);
-	g_assert_nonnull (fw_data);
+	g_assert_nonnull (fw_file);
+
+	fw_data = g_mapped_file_get_bytes (fw_file);
 
 	/* simulate an update, where the device goes away and comes back
 	 * after the time in the last parameter (given in ms) */
