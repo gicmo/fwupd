@@ -32,7 +32,7 @@
 #include <glib.h>
 #include <gudev/gudev.h>
 
-#include "fu-plugin.h"
+#include "fu-plugin-thunderbolt.h"
 #include "fu-plugin-vfuncs.h"
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(GUdevDevice, g_object_unref)
@@ -48,6 +48,12 @@ struct FuPluginData {
 	/* in the case we are updating */
 	UEventNotify   update_notify;
 	gpointer       update_data;
+
+	/* the timeout we wait for the device
+	 * to be updated to re-appear, in ms.
+	 * defaults to:
+	 *  FU_PLUGIN_THUNDERBOLT_UPDATE_TIMEOUT_MS */
+	guint timeout;
 };
 
 
@@ -545,7 +551,6 @@ remove_leftover_devices (gpointer key,
 static gboolean
 fu_plugin_thunderbolt_wait_for_device (FuPlugin  *plugin,
 				       FuDevice  *dev,
-				       guint      timeout_ms,
 				       GError   **error)
 {
 	FuPluginData *data = fu_plugin_get_data (plugin);
@@ -558,7 +563,7 @@ fu_plugin_thunderbolt_wait_for_device (FuPlugin  *plugin,
 
 	/* this will limit the maximum amount of time we wait for
 	 * the device (i.e. 'dev') to re-appear. */
-	up_data.timeout_id = g_timeout_add (timeout_ms,
+	up_data.timeout_id = g_timeout_add (data->timeout,
 					    on_wait_for_device_timeout,
 					    mainloop);
 
@@ -589,6 +594,16 @@ fu_plugin_thunderbolt_wait_for_device (FuPlugin  *plugin,
 	return up_data.have_device;
 }
 
+/* internal interface  */
+
+void
+fu_plugin_thunderbolt_set_timeout (FuPlugin *plugin,
+				   guint     timeout_ms)
+{
+	FuPluginData *data = fu_plugin_get_data (plugin);
+	data->timeout = timeout_ms;
+}
+
 /* virtual functions */
 
 void
@@ -600,6 +615,8 @@ fu_plugin_init (FuPlugin *plugin)
 	data->udev = g_udev_client_new (subsystems);
 	g_signal_connect (data->udev, "uevent",
 			  G_CALLBACK (udev_uevent_cb), plugin);
+
+	data->timeout = FU_PLUGIN_THUNDERBOLT_UPDATE_TIMEOUT_MS;
 }
 
 void
@@ -627,7 +644,6 @@ fu_plugin_coldplug (FuPlugin *plugin, GError **error)
 	return TRUE;
 }
 
-#define FU_PLUGIN_THUNDERBOLT_UPDATE_TIMEOUT_MS 60 * 1000
 
 gboolean
 fu_plugin_update_online (FuPlugin *plugin,
@@ -693,7 +709,6 @@ fu_plugin_update_online (FuPlugin *plugin,
 	 * and then check if we find an error */
 	ret = fu_plugin_thunderbolt_wait_for_device (plugin,
 						     dev,
-						     FU_PLUGIN_THUNDERBOLT_UPDATE_TIMEOUT_MS,
 						     &error_local);
 	if (!ret) {
 		g_set_error (error,

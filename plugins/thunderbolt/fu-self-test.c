@@ -40,6 +40,7 @@
 #include <locale.h>
 
 #include "fu-plugin-private.h"
+#include "fu-plugin-thunderbolt.h"
 #include "fu-test.h"
 
 static gchar *
@@ -513,10 +514,18 @@ mock_tree_detach (MockTree *node)
 	node->bed = NULL;
 }
 
+typedef enum UpdateResult {
+	UPDATE_SUCCESS     = 0,
+	/* nvm_authenticate will report error condition */
+	UPDATE_FAIL_DEVICE_INTERNAL = 1,
+	/* device to be updated will NOT re-appear */
+	UPDATE_FAIL_DEVICE_NOSHOW   = 2
+} UpdateResult;
+
 typedef struct UpdateContext {
 	GFileMonitor *monitor;
 
-	guint result;
+	UpdateResult result;
 	guint timeout;
 	GBytes *data;
 	UMockdevTestbed *bed;
@@ -586,16 +595,23 @@ udev_file_changed_cb (GFileMonitor     *monitor,
 	g_debug ("Removing tree below and including: %s", ctx->node->path);
 	mock_tree_detach (ctx->node);
 
-	ctx->node->nvm_authenticate = ctx->result;
+	ctx->node->nvm_authenticate = (guint) ctx->result;
 
 	/* update the version only on "success" simulations */
-	if (ctx->result == 0) {
+	if (ctx->result == UPDATE_SUCCESS) {
 		g_free (ctx->node->nvm_version);
 		ctx->node->nvm_version = g_strdup (ctx->version);
 	}
 
 	g_debug ("Simulating update to '%s' with result: 0x%x",
 		 ctx->version, ctx->node->nvm_authenticate);
+
+	if (ctx->result == UPDATE_FAIL_DEVICE_NOSHOW) {
+		g_debug ("Simulating no-show fail:"
+			 " device tree will not reappear");
+		return;
+	}
+
 	g_debug ("Device tree reattachment in %3.2f seconds",
 		 ctx->timeout / 1000.0);
 	g_timeout_add (ctx->timeout, reattach_tree, ctx);
@@ -887,7 +903,7 @@ test_update_fail (ThunderboltTest *tt, gconstpointer user_data)
 	 * but simulate an error indicated by the device
 	 */
 	up_ctx = mock_tree_prepare_for_update (tree, plugin, "42.23", fw_data, 1000);
-	up_ctx->result = 0x1;
+	up_ctx->result = UPDATE_FAIL_DEVICE_INTERNAL;
 
 	ret = fu_plugin_runner_update (plugin, tree->fu_device, NULL, fw_data, 0, &error);
 	g_assert_error (error, FWUPD_ERROR, FWUPD_ERROR_INTERNAL);
@@ -907,6 +923,36 @@ test_update_fail (ThunderboltTest *tt, gconstpointer user_data)
 	ret = mock_tree_all (tree, mock_tree_node_have_fu_device, NULL);
 	g_assert_true (ret);
 }
+
+
+static void
+test_update_fail_nowshow (ThunderboltTest *tt, gconstpointer user_data)
+{
+	FuPlugin *plugin = tt->plugin;
+	MockTree *tree = tt->tree;
+	GBytes *fw_data = tt->fw_data;
+	gboolean ret;
+	g_autoptr(GError) error = NULL;
+	g_autoptr(UpdateContext) up_ctx = NULL;
+
+	/* test sanity check */
+	g_assert_nonnull (tree);
+	g_assert_nonnull (fw_data);
+
+	/* simulate an update, as in test_update_working,
+	 * but simulate an error indicated by the device
+	 */
+	up_ctx = mock_tree_prepare_for_update (tree, plugin, "42.23", fw_data, 1000);
+	up_ctx->result = UPDATE_FAIL_DEVICE_NOSHOW;
+
+	/* lets make the plugin only wait a second for the device */
+	fu_plugin_thunderbolt_set_timeout (plugin, 1000);
+
+	ret = fu_plugin_runner_update (plugin, tree->fu_device, NULL, fw_data, 0, &error);
+	g_assert_error (error, FWUPD_ERROR, FWUPD_ERROR_NOT_FOUND);
+	g_assert_false (ret);
+}
+
 
 int
 main (int argc, char **argv)
@@ -939,6 +985,13 @@ main (int argc, char **argv)
 		    TEST_INIT_FULL,
 		    test_set_up,
 		    test_update_fail,
+		    test_tear_down);
+
+	g_test_add ("/thunderbolt/update{failing-noshow}",
+		    ThunderboltTest,
+		    TEST_INIT_FULL,
+		    test_set_up,
+		    test_update_fail_nowshow,
 		    test_tear_down);
 
 	return g_test_run ();
