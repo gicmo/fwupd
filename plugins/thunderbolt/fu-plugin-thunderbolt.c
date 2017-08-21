@@ -43,11 +43,11 @@ typedef void (*UEventNotify) (FuPlugin	  *plugin,
 			      gpointer     user_data);
 
 struct FuPluginData {
-	GUdevClient     *udev;
+	GUdevClient   *udev;
 
 	/* in the case we are updating */
-	UEventNotify     update_notify;
-	gpointer         update_data;
+	UEventNotify   update_notify;
+	gpointer       update_data;
 };
 
 
@@ -191,7 +191,7 @@ fu_plugin_thunderbolt_add (FuPlugin *plugin, GUdevDevice *device)
 	dev = fu_device_new ();
 	fu_device_set_id (dev, uuid);
 
-	fu_device_set_metadata(dev, "sysfs-path", devpath);
+	fu_device_set_metadata (dev, "sysfs-path", devpath);
 	name = g_udev_device_get_sysfs_attr (device, "device_name");
 	if (name != NULL) {
 		if (is_host) {
@@ -311,11 +311,14 @@ fu_plugin_thunderbolt_find_nvmem (GUdevDevice  *udevice,
 	while ((name = g_dir_read_name (d)) != NULL) {
 		if (g_str_has_prefix (name, "nvm_non_active")) {
 			g_autoptr(GFile) parent = g_file_new_for_path (devpath);
-			g_autoptr(GFile) nvm_dir =g_file_get_child (parent, name);
+			g_autoptr(GFile) nvm_dir = g_file_get_child (parent, name);
 			return g_file_get_child (nvm_dir, "nvmem");
 		}
 	}
 
+	g_set_error_literal (error,
+			     FWUPD_ERROR, FWUPD_ERROR_NOT_SUPPORTED,
+			     "Could not find non-volatile memory location");
 	return NULL;
 }
 
@@ -325,8 +328,8 @@ fu_plugin_thunderbolt_trigger_update (GUdevDevice  *udevice,
 {
 
 	const gchar *devpath;
-	int fd;
 	ssize_t n;
+	int fd;
 	g_autofree gchar *auth_path = NULL;
 
 	devpath = g_udev_device_get_sysfs_path (udevice);
@@ -368,7 +371,6 @@ fu_plugin_thunderbolt_write_firmware (GUdevDevice  *udevice,
 	g_autoptr(GFile) nvmem = NULL;
 	g_autoptr(GOutputStream) os = NULL;
 
-	/* TODO: error propagation */
 	nvmem = fu_plugin_thunderbolt_find_nvmem (udevice, error);
 	if (nvmem == NULL)
 		return FALSE;
@@ -690,9 +692,9 @@ fu_plugin_update_online (FuPlugin *plugin,
 	/* the device will disappear and we need to wait until it reappears,
 	 * and then check if we find an error */
 	ret = fu_plugin_thunderbolt_wait_for_device (plugin,
-						    dev,
-						    FU_PLUGIN_THUNDERBOLT_UPDATE_TIMEOUT_MS,
-						    &error_local);
+						     dev,
+						     FU_PLUGIN_THUNDERBOLT_UPDATE_TIMEOUT_MS,
+						     &error_local);
 	if (!ret) {
 		g_set_error (error,
 			     FWUPD_ERROR,
@@ -703,7 +705,9 @@ fu_plugin_update_online (FuPlugin *plugin,
 	}
 
 	/* now check if the update actually worked */
-	status = udev_device_get_sysattr_guint64 (udevice, "nvm_authenticate", &error_local);
+	status = udev_device_get_sysattr_guint64 (udevice,
+						  "nvm_authenticate",
+						  &error_local);
 
 	/* anything else then 0x0 means we got an error */
 	ret = status == 0x0;

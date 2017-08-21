@@ -42,44 +42,6 @@
 #include "fu-plugin-private.h"
 #include "fu-test.h"
 
-typedef struct ThunderboltTest {
-	UMockdevTestbed *bed;
-	FuPlugin *plugin;
-} ThunderboltTest;
-
-static void
-test_set_up (ThunderboltTest *tt, gconstpointer user_data)
-{
-	gboolean ok;
-	g_autoptr(GError) error = NULL;
-
-	tt->bed = umockdev_testbed_new ();
-	g_assert_nonnull (tt->bed);
-
-	g_debug ("mock sysfs at %s", umockdev_testbed_get_sys_dir (tt->bed));
-
-	tt->plugin = fu_plugin_new ();
-	g_assert_nonnull (tt->plugin);
-
-	ok = fu_plugin_open (tt->plugin, PLUGINBUILDDIR "/libfu_plugin_thunderbolt.so", &error);
-
-	g_assert_no_error (error);
-	g_assert_true (ok);
-
-	ok = fu_plugin_runner_startup (tt->plugin, &error);
-	g_assert_no_error (error);
-	g_assert_true (ok);
-
-}
-
-static void
-test_tear_down (ThunderboltTest *tt, gconstpointer user_data)
-{
-	g_object_unref (tt->plugin);
-	g_object_unref (tt->bed);
-}
-
-
 static gchar *
 udev_mock_add_domain (UMockdevTestbed *bed, int id)
 {
@@ -624,10 +586,17 @@ udev_file_changed_cb (GFileMonitor     *monitor,
 	g_debug ("Removing tree below and including: %s", ctx->node->path);
 	mock_tree_detach (ctx->node);
 
-	g_free (ctx->node->nvm_version);
-	ctx->node->nvm_version = g_strdup (ctx->version);
+	ctx->node->nvm_authenticate = ctx->result;
 
-	g_debug ("Simulating update and scheduling tree reattachment in %3.2f seconds",
+	/* update the version only on "success" simulations */
+	if (ctx->result == 0) {
+		g_free (ctx->node->nvm_version);
+		ctx->node->nvm_version = g_strdup (ctx->version);
+	}
+
+	g_debug ("Simulating update to '%s' with result: 0x%x",
+		 ctx->version, ctx->node->nvm_authenticate);
+	g_debug ("Device tree reattachment in %3.2f seconds",
 		 ctx->timeout / 1000.0);
 	g_timeout_add (ctx->timeout, reattach_tree, ctx);
 }
@@ -666,8 +635,6 @@ mock_tree_prepare_for_update (MockTree    *node,
 
 	return ctx;
 }
-
-
 
 static MockDevice root_one = {
 
@@ -709,6 +676,111 @@ static MockDevice root_one = {
 	},
 
 };
+
+
+typedef struct TestParam {
+	gboolean initialize_tree;
+	gboolean attach_and_coldplug;
+
+	const char *firmware_file;
+} TestParam;
+
+typedef enum TestFlags {
+	TEST_INITIALIZE_TREE     = 1 << 0,
+	TEST_ATTACH_AND_COLDPLUG = 1 << 1,
+	TEST_PREPARE_FIRMWARE    = 1 << 2,
+
+	TEST_PREPARE_ALL = TEST_INITIALIZE_TREE |
+	                   TEST_ATTACH_AND_COLDPLUG |
+	                   TEST_PREPARE_FIRMWARE
+} TestFlags;
+
+#define TEST_INIT_FULL (GUINT_TO_POINTER (TEST_PREPARE_ALL))
+
+typedef struct ThunderboltTest {
+	UMockdevTestbed *bed;
+	FuPlugin *plugin;
+
+	/* if TestParam::initialize_tree */
+	MockTree *tree;
+
+	/* if TestParam::firmware_file is nonnull */
+	GMappedFile *fw_file;
+	GBytes      *fw_data;
+
+} ThunderboltTest;
+
+static void
+test_set_up (ThunderboltTest *tt, gconstpointer params)
+{
+	TestFlags flags = GPOINTER_TO_UINT(params);
+	gboolean ret;
+	g_autoptr(GError) error = NULL;
+
+	tt->bed = umockdev_testbed_new ();
+	g_assert_nonnull (tt->bed);
+
+	g_debug ("mock sysfs at %s", umockdev_testbed_get_sys_dir (tt->bed));
+
+	tt->plugin = fu_plugin_new ();
+	g_assert_nonnull (tt->plugin);
+
+	ret = fu_plugin_open (tt->plugin, PLUGINBUILDDIR "/libfu_plugin_thunderbolt.so", &error);
+
+	g_assert_no_error (error);
+	g_assert_true (ret);
+
+	ret = fu_plugin_runner_startup (tt->plugin, &error);
+	g_assert_no_error (error);
+	g_assert_true (ret);
+
+	if (flags & TEST_INITIALIZE_TREE) {
+		tt->tree = mock_tree_init (&root_one);
+		g_assert_nonnull (tt->tree);
+	}
+
+	if (flags & TEST_ATTACH_AND_COLDPLUG) {
+		g_assert_true (flags & TEST_INITIALIZE_TREE);
+
+		ret = fu_plugin_runner_coldplug (tt->plugin, &error);
+		g_assert_no_error (error);
+		g_assert_true (ret);
+
+		ret = mock_tree_attach (tt->tree, tt->bed, tt->plugin);
+		g_assert_true (ret);
+	}
+
+	if (flags & TEST_PREPARE_FIRMWARE) {
+		g_autofree gchar *fw_path = NULL;
+
+		fw_path = fu_test_get_filename (TESTDATADIR, "colorhug/firmware.bin");
+		g_assert_nonnull (fw_path);
+		tt->fw_file = g_mapped_file_new (fw_path, FALSE, &error);
+		g_assert_no_error (error);
+		g_assert_nonnull (tt->fw_file);
+
+		tt->fw_data = g_mapped_file_get_bytes (tt->fw_file);
+		g_assert_nonnull (tt->fw_data);
+	}
+}
+
+static void
+test_tear_down (ThunderboltTest *tt, gconstpointer user_data)
+{
+	g_object_unref (tt->plugin);
+	g_object_unref (tt->bed);
+
+	if (tt->tree)
+		mock_tree_free (tt->tree);
+
+	if (tt->fw_data)
+		g_bytes_unref (tt->fw_data);
+
+	if (tt->fw_file)
+		g_mapped_file_unref (tt->fw_file);
+}
+
+
 
 static gboolean
 test_tree_uuids (const MockTree *node, gpointer data)
@@ -758,38 +830,20 @@ test_tree (ThunderboltTest *tt, gconstpointer user_data)
 	mock_tree_all (tree, mock_tree_node_is_detached, NULL);
 }
 
-
 static void
 test_update_working (ThunderboltTest *tt, gconstpointer user_data)
 {
 	FuPlugin *plugin = tt->plugin;
+	MockTree *tree = tt->tree;
+	GBytes *fw_data = tt->fw_data;
 	gboolean ret;
 	const gchar *version_after;
-	g_autofree gchar *fw_path = NULL;
-	g_autoptr(MockTree) tree = NULL;
 	g_autoptr(GError) error = NULL;
-	g_autoptr(GBytes) fw_data = NULL;
 	g_autoptr(UpdateContext) up_ctx = NULL;
-	g_autoptr(GMappedFile) fw_file = NULL;
 
-	tree = mock_tree_init (&root_one);
+	/* test sanity check */
 	g_assert_nonnull (tree);
-
-	ret = fu_plugin_runner_coldplug (tt->plugin, &error);
-	g_assert_no_error (error);
-	g_assert_true (ret);
-
-	ret = mock_tree_attach (tree, tt->bed, tt->plugin);
-	g_assert_true (ret);
-
-	/* we just want a biggish binary blob for now */
-	fw_path = fu_test_get_filename (TESTDATADIR, "colorhug/firmware.bin");
-	g_assert_nonnull (fw_path);
-	fw_file = g_mapped_file_new (fw_path, FALSE, &error);
-	g_assert_no_error (error);
-	g_assert_nonnull (fw_file);
-
-	fw_data = g_mapped_file_get_bytes (fw_file);
+	g_assert_nonnull (fw_data);
 
 	/* simulate an update, where the device goes away and comes back
 	 * after the time in the last parameter (given in ms) */
@@ -814,8 +868,48 @@ test_update_working (ThunderboltTest *tt, gconstpointer user_data)
 	g_assert_true (ret);
 }
 
+static void
+test_update_fail (ThunderboltTest *tt, gconstpointer user_data)
+{
+	FuPlugin *plugin = tt->plugin;
+	MockTree *tree = tt->tree;
+	GBytes *fw_data = tt->fw_data;
+	gboolean ret;
+	const gchar *version_after;
+	g_autoptr(GError) error = NULL;
+	g_autoptr(UpdateContext) up_ctx = NULL;
+
+	/* test sanity check */
+	g_assert_nonnull (tree);
+	g_assert_nonnull (fw_data);
+
+	/* simulate an update, as in test_update_working,
+	 * but simulate an error indicated by the device
+	 */
+	up_ctx = mock_tree_prepare_for_update (tree, plugin, "42.23", fw_data, 1000);
+	up_ctx->result = 0x1;
+
+	ret = fu_plugin_runner_update (plugin, tree->fu_device, NULL, fw_data, 0, &error);
+	g_assert_error (error, FWUPD_ERROR, FWUPD_ERROR_INTERNAL);
+	g_assert_false (ret);
+
+	/* version should *not* have changed */
+	version_after = fu_device_get_version (tree->fu_device);
+	g_debug ("version after update: %s", version_after);
+	g_assert_cmpstr (version_after, ==, tree->device->nvm_version);
+
+	/* we wait until the plugin has picked up  all the
+	 * subtree changes, and make sure we still receive
+	 * udev updates correctly and are in sync */
+	ret = mock_tree_settle (tree, plugin);
+	g_assert_true (ret);
+
+	ret = mock_tree_all (tree, mock_tree_node_have_fu_device, NULL);
+	g_assert_true (ret);
+}
+
 int
-main(int argc, char **argv)
+main (int argc, char **argv)
 {
 	g_test_init (&argc, &argv, NULL);
 	g_log_set_fatal_mask (NULL, G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL);
@@ -835,9 +929,16 @@ main(int argc, char **argv)
 
 	g_test_add ("/thunderbolt/update{working}",
 		    ThunderboltTest,
-		    NULL,
+		    TEST_INIT_FULL,
 		    test_set_up,
 		    test_update_working,
+		    test_tear_down);
+
+	g_test_add ("/thunderbolt/update{failing}",
+		    ThunderboltTest,
+		    TEST_INIT_FULL,
+		    test_set_up,
+		    test_update_fail,
 		    test_tear_down);
 
 	return g_test_run ();
